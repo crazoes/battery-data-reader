@@ -38,25 +38,25 @@ type RC4Cipher struct {
 }
 
 func NewRC4Cipher(key []byte) *RC4Cipher {
-	s := make([]byte, 256)
-	for i := 0; i < 256; i++ {
-		s[i] = byte(i)
-	}
+    s := make([]byte, 256)
+    for i := 0; i < 256; i++ {
+        s[i] = byte(i)
+    }
 
-	var j uint8 = 0
-	for i := 0; i < 256; i++ {
-		j = j + s[i] + key[i%len(key)]
-		s[i], s[j] = s[j], s[i]
-	}
+    var j uint8 = 0
+    for i := 0; i < 256; i++ {
+        j = j + s[i] + key[i%len(key)]
+        s[i], s[j] = s[j], s[i]
+    }
 
-	return &RC4Cipher{S: s, i: 0, j: 0}
+    return &RC4Cipher{S: s, i: 0, j: 0}
 }
 
 func (c *RC4Cipher) GetByte() byte {
-	c.i++
-	c.j += c.S[c.i]
-	c.S[c.i], c.S[c.j] = c.S[c.j], c.S[c.i]
-	return c.S[uint8(int(c.S[c.i])+int(c.S[c.j]))&0xff]
+    c.i = c.i + 1
+    c.j = c.j + c.S[c.i]
+    c.S[c.i], c.S[c.j] = c.S[c.j], c.S[c.i]
+    return c.S[(uint8(c.S[c.i])+uint8(c.S[c.j]))]
 }
 
 func (c *RC4Cipher) Encrypt(data []byte) []byte {
@@ -440,9 +440,11 @@ func connectAndHandleJackery(ctx context.Context, deviceAddr string) error {
     }
 
     // Subscribe to notifications
+    var collectedData []byte
     if err := client.Subscribe(notifyChar, false, func(data []byte) {
         fmt.Printf("Received notification: %x\n", data)
         responseChan <- data
+        collectedData = append(collectedData, data...)
     }); err != nil {
         fmt.Printf("Warning: Failed to subscribe to notifications: %v\n", err)
     }
@@ -451,62 +453,143 @@ func connectAndHandleJackery(ctx context.Context, deviceAddr string) error {
     handshake := []byte{0x6d, 0xc7, 0x84, 0xb9, 0xd8, 0xa4, 0x48, 0xd5, 0x18}
     fmt.Printf("Sending handshake: %x\n", handshake)
     
-    if err := client.WriteCharacteristic(writeChar, handshake, false); err != nil {
+    if err := client.WriteCharacteristic(writeChar, handshake, true); err != nil {
         return fmt.Errorf("handshake failed: %v", err)
     }
 
     // Wait for response with timeout
     fmt.Println("Waiting for response...")
-    select {
-    case data := <-responseChan:
-        fmt.Printf("Raw response: %x\n", data)
-        
-        // Decrypt the data
-        decrypted := DecryptJackery(defaultJackeryKey, data)
-        fmt.Printf("Decrypted: %x\n", decrypted)
-        
-        if len(decrypted) < 13 {
-            return fmt.Errorf("response too short (%d bytes)", len(decrypted))
-        }
+    
+    // Wait for enough data to be collected
+    timeout := time.After(5 * time.Second)
+    ticker := time.NewTicker(100 * time.Millisecond)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            if len(collectedData) > 0 {
+                // Process all collected data
+                fmt.Printf("Raw data received: %x\n", collectedData)
+                
+                // Decrypt the data
+                decrypted := DecryptJackery(defaultJackeryKey, collectedData)
+                fmt.Printf("Decrypted data: %x\n", decrypted)
+                
+                if len(decrypted) < 13 {
+                    return fmt.Errorf("decrypted data too short (%d bytes)", len(decrypted))
+                }
 
-        // Process payload (skip 10 byte header, ignore 3 byte footer)
-        payload := decrypted[10 : len(decrypted)-3]
-        xorValue := decrypted[len(decrypted)-3]
-        
-        var result strings.Builder
-        for _, b := range payload {
-            result.WriteByte(b ^ xorValue)
-        }
+                // Try multiple decoding approaches
+                
+                // First try: standard format with 10-byte header and 3-byte footer
+                if len(decrypted) >= 13 {
+                    payload := decrypted[10 : len(decrypted)-3]
+                    xorKey := decrypted[len(decrypted)-3]
+                    
+                    var result strings.Builder
+                    for _, b := range payload {
+                        result.WriteByte(b ^ xorKey)
+                    }
+                    
+                    decodedStr := result.String()
+                    fmt.Printf("\n=== Jackery Device Data (Format 1) ===\n%s\n", decodedStr)
+                    
+                    // Try to parse as JSON
+                    var jsonData interface{}
+                    if err := json.Unmarshal([]byte(decodedStr), &jsonData); err == nil {
+                        // If valid JSON, pretty-print it
+                        prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
+                        fmt.Printf("\n=== Formatted Jackery Data ===\n%s\n", string(prettyJSON))
+                        return nil
+                    }
+                }
+                
+                // Second try: alternative format (some models use a different structure)
+                if len(decrypted) >= 20 {
+                    // Different payload position - start after first 16 bytes
+                    payload := decrypted[16 : len(decrypted)-4]
+                    xorKey := decrypted[len(decrypted)-4]
+                    
+                    var result strings.Builder
+                    for _, b := range payload {
+                        result.WriteByte(b ^ xorKey)
+                    }
+                    
+                    decodedStr := result.String()
+                    fmt.Printf("\n=== Jackery Device Data (Format 2) ===\n%s\n", decodedStr)
+                    
+                    // Try to parse as JSON
+                    var jsonData interface{}
+                    if err := json.Unmarshal([]byte(decodedStr), &jsonData); err == nil {
+                        // If valid JSON, pretty-print it
+                        prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
+                        fmt.Printf("\n=== Formatted Jackery Data ===\n%s\n", string(prettyJSON))
+                        return nil
+                    }
+                }
+                
+                // If we get here, try one more approach - sometimes there's no XOR at all
+                if len(decrypted) > 10 {
+                    payload := decrypted[10:]
+                    decodedStr := string(payload)
+                    fmt.Printf("\n=== Jackery Device Data (Format 3) ===\n%s\n", decodedStr)
+                    
+                    // Try to parse as JSON
+                    var jsonData interface{}
+                    if err := json.Unmarshal([]byte(decodedStr), &jsonData); err == nil {
+                        // If valid JSON, pretty-print it
+                        prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
+                        fmt.Printf("\n=== Formatted Jackery Data ===\n%s\n", string(prettyJSON))
+                        return nil
+                    }
+                }
+                
+                fmt.Println("Warning: Could not decode data in any known format")
+                return nil
+            }
+        case <-timeout:
+            if len(collectedData) > 0 {
+                // Process whatever data we have
+                fmt.Printf("Timeout reached, processing available data: %x\n", collectedData)
+                
+                // Continue with processing as above...
+                decrypted := DecryptJackery(defaultJackeryKey, collectedData)
+                
+                if len(decrypted) < 13 {
+                    return fmt.Errorf("decrypted data too short (%d bytes)", len(decrypted))
+                }
 
-        fmt.Printf("\n=== Jackery Device Data ===\n%s\n", result.String())
-        return nil
-
-    case <-time.After(10 * time.Second):
-        // Fallback to manual read
-        fmt.Println("No notification received, attempting manual read...")
-        data, err := client.ReadCharacteristic(notifyChar)
-        if err != nil {
-            return fmt.Errorf("manual read failed: %v", err)
-        }
-        
-        if len(data) > 0 {
-            fmt.Printf("Manual read data: %x\n", data)
-            decrypted := DecryptJackery(defaultJackeryKey, data)
-            if len(decrypted) >= 13 {
+                // Standard approach
                 payload := decrypted[10 : len(decrypted)-3]
                 xorValue := decrypted[len(decrypted)-3]
+                
                 var result strings.Builder
                 for _, b := range payload {
                     result.WriteByte(b ^ xorValue)
                 }
+
                 fmt.Printf("\n=== Jackery Device Data ===\n%s\n", result.String())
                 return nil
             }
+            return fmt.Errorf("timeout waiting for data")
+        case <-ctx.Done():
+            return fmt.Errorf("operation canceled")
         }
-        return fmt.Errorf("no response received")
+    }
+}
 
-    case <-ctx.Done():
-        return fmt.Errorf("operation canceled")
+// Helper functions
+func isValidJSON(s string) bool {
+    var js interface{}
+    return json.Unmarshal([]byte(s), &js) == nil
+}
+
+func prettyPrint(jsonStr string) {
+    var data interface{}
+    if err := json.Unmarshal([]byte(jsonStr), &data); err == nil {
+        pretty, _ := json.MarshalIndent(data, "", "  ")
+        fmt.Printf("\n=== Formatted Jackery Data ===\n%s\n", string(pretty))
     }
 }
 
