@@ -246,124 +246,164 @@ func connectAndHandleYeti(ctx context.Context, deviceAddr string) error {
 	return nil
 }
 
+// Fix for connectAndHandleGoalZero function
 func connectAndHandleGoalZero(ctx context.Context, deviceAddr string) error {
-	client, err := ble.Dial(ctx, ble.NewAddr(deviceAddr))
-	if err != nil {
-		return fmt.Errorf("failed to connect: %v", err)
-	}
-	defer client.CancelConnection()
+    client, err := ble.Dial(ctx, ble.NewAddr(deviceAddr))
+    if err != nil {
+        return fmt.Errorf("failed to connect: %v", err)
+    }
+    defer client.CancelConnection()
 
-	fmt.Printf("Connected to %s\n", deviceAddr)
+    fmt.Printf("Connected to %s\n", deviceAddr)
 
-	// Discover services
-	ss, err := client.DiscoverServices(nil)
-	if err != nil {
-		return fmt.Errorf("failed to discover services: %v", err)
-	}
+    // Exchange MTU first
+    if _, err := client.ExchangeMTU(512); err != nil {
+        fmt.Printf("Warning: MTU exchange failed: %v\n", err)
+    }
+    time.Sleep(500 * time.Millisecond)
 
-	// Find the RPC service
-	var rpcService *ble.Service
-	for _, s := range ss {
-		if strings.Contains(strings.ToLower(s.UUID.String()), serviceUUID) {
-			rpcService = s
-			break
-		}
-	}
+    // Discover all services
+    ss, err := client.DiscoverServices(nil)
+    if err != nil {
+        return fmt.Errorf("failed to discover services: %v", err)
+    }
 
-	if rpcService == nil {
-		return fmt.Errorf("RPC service not found")
-	}
+    // Find the RPC service by UUID prefix (without hyphens)
+    var rpcService *ble.Service
+    targetServiceUUID := "5f6d4f535f5250435f5356435f49445f"
+    for _, s := range ss {
+        if strings.ToLower(s.UUID.String()) == targetServiceUUID {
+            rpcService = s
+            break
+        }
+    }
 
-	// Discover characteristics
-	cs, err := client.DiscoverCharacteristics(nil, rpcService)
-	if err != nil {
-		return fmt.Errorf("failed to discover characteristics: %v", err)
-	}
+    if rpcService == nil {
+        return fmt.Errorf("RPC service not found (looking for UUID %s)", targetServiceUUID)
+    }
 
-	// Find required characteristics
-	var dataChar, rxChar, txChar *ble.Characteristic
-	for _, c := range cs {
-		cUUID := strings.ToLower(c.UUID.String())
-		switch {
-		case strings.Contains(cUUID, characteristicUUIDData):
-			dataChar = c
-		case strings.Contains(cUUID, characteristicUUIDRx):
-			rxChar = c
-		case strings.Contains(cUUID, characteristicUUIDTx):
-			txChar = c
-		}
-	}
+    // Discover all characteristics in the RPC service
+    cs, err := client.DiscoverCharacteristics(nil, rpcService)
+    if err != nil {
+        return fmt.Errorf("failed to discover characteristics: %v", err)
+    }
 
-	if dataChar == nil || rxChar == nil || txChar == nil {
-		return fmt.Errorf("missing required characteristics")
-	}
+    // Find required characteristics by their full UUIDs (without hyphens)
+    var dataChar, rxChar, txChar *ble.Characteristic
+    for _, c := range cs {
+        cUUID := strings.ToLower(c.UUID.String())
+        switch cUUID {
+        case "5f6d4f535f5250435f646174615f5f5f": // DATA
+            dataChar = c
+            fmt.Println("Found DATA characteristic")
+        case "5f6d4f535f5250435f72785f63746c5f": // RX
+            rxChar = c
+            fmt.Println("Found RX characteristic")
+        case "5f6d4f535f5250435f74785f63746c5f": // TX
+            txChar = c
+            fmt.Println("Found TX characteristic")
+        }
+    }
 
-	// Send command to initiate data transfer
-	if err := client.WriteCharacteristic(txChar, []byte{0x00, 0x00, 0x00, 0x1a}, false); err != nil {
-		return fmt.Errorf("failed to write to TX characteristic: %v", err)
-	}
-	time.Sleep(500 * time.Millisecond)
+    if dataChar == nil {
+        return fmt.Errorf("DATA characteristic not found (looking for UUID 5f6d4f535f5250435f646174615f5f5f)")
+    }
+    if rxChar == nil {
+        return fmt.Errorf("RX characteristic not found (looking for UUID 5f6d4f535f5250435f72785f63746c5f)")
+    }
+    if txChar == nil {
+        return fmt.Errorf("TX characteristic not found (looking for UUID 5f6d4f535f5250435f74785f63746c5f)")
+    }
 
-	if err := client.WriteCharacteristic(dataChar, []byte(`{"id":2,"method":"status"}`), false); err != nil {
-		return fmt.Errorf("failed to write to DATA characteristic: %v", err)
-	}
-	time.Sleep(1 * time.Second)
+    // Send command to initiate data transfer
+    fmt.Println("Sending initialization command...")
+    if err := client.WriteCharacteristic(txChar, []byte{0x00, 0x00, 0x00, 0x1a}, false); err != nil {
+        return fmt.Errorf("failed to write to TX characteristic: %v", err)
+    }
+    time.Sleep(500 * time.Millisecond)
 
-	// Read response data
-	fmt.Println("\nReading device data...")
-	var fullData []byte
-	maxReadAttempts := 10
+    fmt.Println("Sending status request...")
+    if err := client.WriteCharacteristic(dataChar, []byte(`{"id":2,"method":"status"}`), false); err != nil {
+        return fmt.Errorf("failed to write to DATA characteristic: %v", err)
+    }
+    time.Sleep(1 * time.Second)
 
-	for i := 0; i < maxReadAttempts; i++ {
-		dataPart, err := client.ReadCharacteristic(dataChar)
-		if err != nil {
-			return fmt.Errorf("read failed (attempt %d): %v", i+1, err)
-		}
-		
-		fullData = append(fullData, dataPart...)
-		
-		// Check if we have complete JSON
-		var response map[string]interface{}
-		if json.Unmarshal(fullData, &response) == nil {
-			break
-		}
-		
-		time.Sleep(500 * time.Millisecond)
-	}
+    // Read response data
+    fmt.Println("\nReading device data...")
+    var fullData []byte
+    maxReadAttempts := 5
 
-	if len(fullData) == 0 {
-		return fmt.Errorf("no data received from device")
-	}
+    for i := 0; i < maxReadAttempts; i++ {
+        dataPart, err := client.ReadCharacteristic(dataChar)
+        if err != nil {
+            fmt.Printf("Read failed (attempt %d): %v\n", i+1, err)
+            continue
+        }
+        
+        fullData = append(fullData, dataPart...)
+        
+        // Check if we have complete JSON
+        var response map[string]interface{}
+        if json.Unmarshal(fullData, &response) == nil {
+            if result, ok := response["result"].(map[string]interface{}); ok {
+                if body, ok := result["body"].(map[string]interface{}); ok {
+                    if _, ok := body["batt"]; ok {
+                        break
+                    }
+                }
+            }
+        }
+        
+        time.Sleep(500 * time.Millisecond)
+    }
 
-	// Parse and display the relevant information
-	var responseData struct {
-		Result struct {
-			Body struct {
-				Batt  map[string]interface{} `json:"batt"`
-				Ports map[string]interface{} `json:"ports"`
-			} `json:"body"`
-		} `json:"result"`
-	}
+    if len(fullData) == 0 {
+        return fmt.Errorf("no data received from device")
+    }
 
-	if err := json.Unmarshal(fullData, &responseData); err != nil {
-		return fmt.Errorf("failed to parse response: %v", err)
-	}
+    // Parse and display the relevant information
+    var responseData map[string]interface{}
+    if err := json.Unmarshal(fullData, &responseData); err != nil {
+        return fmt.Errorf("failed to parse JSON response: %v\nRaw data: %s", err, string(fullData))
+    }
 
-	battBytes, err := json.MarshalIndent(responseData.Result.Body.Batt, "", "  ")
-	if err != nil {
-		fmt.Printf("Error marshaling battery data: %v\n", err)
-	} else {
-		fmt.Printf("\nBattery info:\n%s\n", string(battBytes))
-	}
+    // Access nested data more carefully to avoid panics
+    if result, ok := responseData["result"].(map[string]interface{}); ok {
+        if body, ok := result["body"].(map[string]interface{}); ok {
+            if batt, ok := body["batt"].(map[string]interface{}); ok {
+                battBytes, err := json.MarshalIndent(batt, "", "  ")
+                if err != nil {
+                    fmt.Printf("Error marshaling battery data: %v\n", err)
+                } else {
+                    fmt.Printf("\nBattery info:\n%s\n", string(battBytes))
+                }
+            } else {
+                fmt.Println("Battery data not found in response")
+            }
 
-	portsBytes, err := json.MarshalIndent(responseData.Result.Body.Ports, "", "  ")
-	if err != nil {
-		fmt.Printf("Error marshaling ports data: %v\n", err)
-	} else {
-		fmt.Printf("\nPorts info:\n%s\n", string(portsBytes))
-	}
+            if ports, ok := body["ports"].(map[string]interface{}); ok {
+                if v12Out, ok := ports["v12Out"].(map[string]interface{}); ok {
+                    portsBytes, err := json.MarshalIndent(v12Out, "", "  ")
+                    if err != nil {
+                        fmt.Printf("Error marshaling ports data: %v\n", err)
+                    } else {
+                        fmt.Printf("\nV12 Out info:\n%s\n", string(portsBytes))
+                    }
+                } else {
+                    fmt.Println("v12Out data not found in ports")
+                }
+            } else {
+                fmt.Println("Ports data not found in response")
+            }
+        } else {
+            fmt.Println("Body not found in result")
+        }
+    } else {
+        fmt.Println("Result not found in response")
+        fmt.Printf("Full response: %+v\n", responseData)
+    }
 
-	return nil
+    return nil
 }
 
 // JackeryNotificationData holds the notification data from Jackery devices
