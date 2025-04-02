@@ -36,7 +36,6 @@ type RC4Cipher struct {
 	S    []byte
 	i, j uint8
 }
-
 func NewRC4Cipher(key []byte) *RC4Cipher {
     s := make([]byte, 256)
     for i := 0; i < 256; i++ {
