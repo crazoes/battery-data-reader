@@ -1,0 +1,655 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+    "strconv"
+
+	"github.com/go-ble/ble"
+	"github.com/go-ble/ble/examples/lib/dev"
+    "crypto/rc4"
+)
+
+const (
+	// Goal Zero Yeti constants
+	serviceUUID            = "5f6d4f535f5250435f5356435f49445f"
+	characteristicUUIDData = "5f6d4f535f5250435f646174615f5f5f"
+	characteristicUUIDRx   = "5f6d4f535f5250435f72785f63746c5f"
+	characteristicUUIDTx   = "5f6d4f535f5250435f74785f63746c5f"
+
+	// Jackery constants
+	jackeryWriteCharUUID = "0000ee01-0000-1000-8000-00805f9b34fb"
+	jackeryNotifyCharUUID = "0000ee02-0000-1000-8000-00805f9b34fb"
+	defaultJackeryKey = "6*SY1c5B9@"
+)
+
+type DeviceInfo struct {
+	Address string
+	Name    string
+	Type    string // "Yeti", "gz", or "Jackery"
+}
+
+func DecryptJackery(key string, data []byte) ([]byte, error) {
+    cipher, err := rc4.NewCipher([]byte(key))
+    if err != nil {
+        log.Printf("Error creating RC4 cipher: %v", err)
+        return nil, err
+    }
+    
+    decrypted := make([]byte, len(data))
+    cipher.XORKeyStream(decrypted, data)
+    return decrypted, nil
+} 
+
+func DecryptJackeryAndDecode(key string, data []byte) string {
+    decrypted, err := DecryptJackery(key, data)
+    if err != nil {
+        return ""
+    }
+
+	xorValue := decrypted[len(decrypted) - 3]
+	decoded := make([]byte, len(decrypted) - 10 - 3)
+	for i, v := range decrypted[10:len(decrypted) - 3] {
+		decoded[i] = v ^ xorValue
+	}
+	// fmt.Println(hex.EncodeToString(decrypted))
+	fmt.Println(string(decoded))
+    return string(decoded)
+}
+
+var key string
+
+func scanForDevices(ctx context.Context) ([]*DeviceInfo, error) {
+    d, err := dev.NewDevice("default")
+    if err != nil {
+        return nil, fmt.Errorf("failed to initialize device: %v", err)
+    }
+    ble.SetDefaultDevice(d)
+
+    fmt.Println("Scanning for devices...")
+    var foundDevices []*DeviceInfo
+    deviceMap := make(map[string]bool) // Track seen devices by address
+
+    err = ble.Scan(ctx, true, func(adv ble.Advertisement) {
+        addr := adv.Addr().String()
+
+        if strings.HasPrefix(adv.LocalName(), "HT") {
+            srvDatas := adv.ServiceData()
+            if len(srvDatas) == 0 {
+                return
+            }
+            // fmt.Printf("service data for %s: %v\n", adv.LocalName(), adv.ServiceData())
+            srvData := srvDatas[0]
+            
+            // fmt.Printf("srvData: %v\n", srvData)
+            mfd := adv.ManufacturerData()
+            // fmt.Println("mfd", mfd)
+
+            //  2 56 53 54 49 50 52 48 54 48 56 48 52 54 56 48
+            // 53 54 49 50 52 48 54 48 56 48 52 54 56 48
+            smfd := string(mfd[2:])
+            // fmt.Println("smfd", smfd)
+            atoi, err := strconv.Atoi(string(smfd[:2]))
+            if err != nil {
+                fmt.Println("err: ", err)
+            }
+            // new key 8046804e45e46SY1c5B9@
+            key = string(atoi) + smfd[:2] + smfd[len(smfd) - 5:] + "LYx*G!6u9#"
+            data, err := DecryptJackery(key, srvData.Data)
+            if err != nil {
+                fmt.Println("err: ", err)
+            }
+            xorValue := data[len(data) - 3]
+            // fmt.Println("data", data)
+            // fmt.Println("xorvalue", xorValue)
+            // fmt.Println("key", key)
+
+            keyBytes := ""
+            for _, x := range data[2:8] {
+                keyBytes += string(x ^ xorValue)
+            }
+            key = smfd[len(smfd)-6:] + keyBytes + "6*SY1c5B9@"
+            // fmt.Println("keyBytes", keyBytes)
+            // fmt.Println("key 2", key)
+
+            // data = decrypt(chr(int(manufacturer_specific_data[0:2])) + manufacturer_specific_data[0:2] + manufacturer_specific_data[-5:] + "LYx*G!6u9#", service_data)
+            // xor_value = data[:-2][-1]
+            // print("data", data)
+
+            // key_bytes = ""
+            // for x in data[2:8]:
+            //     key_bytes += chr(x ^ xor_value)
+            // key = manufacturer_specific_data[-6:] + key_bytes + key
+            // print("new key", key)
+        }
+        
+        // Skip if we've already seen this device
+        if deviceMap[addr] {
+            return
+        }
+        
+        if strings.HasPrefix(adv.LocalName(), "Yeti") {
+            fmt.Printf("Found device: %s (%s) [Yeti]\n", adv.LocalName(), addr)
+            foundDevices = append(foundDevices, &DeviceInfo{
+                Address: addr,
+                Name:    adv.LocalName(),
+                Type:    "Yeti",
+            })
+            deviceMap[addr] = true
+        } else if strings.HasPrefix(adv.LocalName(), "gz") {
+            fmt.Printf("Found device: %s (%s) [gz]\n", adv.LocalName(), addr)
+            foundDevices = append(foundDevices, &DeviceInfo{
+                Address: addr,
+                Name:    adv.LocalName(),
+                Type:    "gz",
+            })
+            deviceMap[addr] = true
+        } else if strings.HasPrefix(adv.LocalName(), "HT") {
+            fmt.Printf("Found device: %s (%s) [Jackery]\n", adv.LocalName(), addr)
+
+            foundDevices = append(foundDevices, &DeviceInfo{
+                Address: addr,
+                Name:    adv.LocalName(),
+                Type:    "Jackery",
+            })
+            deviceMap[addr] = true
+        }
+    }, nil)
+
+    if err != nil && err != context.DeadlineExceeded {
+        return nil, fmt.Errorf("scan failed: %v", err)
+    }
+
+    if len(foundDevices) == 0 {
+        return nil, fmt.Errorf("no compatible devices found")
+    }
+
+    return foundDevices, nil
+}
+
+func connectAndHandleYeti(ctx context.Context, deviceAddr string) error {
+	client, err := ble.Dial(ctx, ble.NewAddr(deviceAddr))
+	if err != nil {
+		return fmt.Errorf("failed to connect: %v", err)
+	}
+	defer client.CancelConnection()
+
+	fmt.Printf("Connected to %s\n", deviceAddr)
+
+	// Exchange MTU for larger packet size
+	if _, err := client.ExchangeMTU(256); err != nil {
+		fmt.Printf("Warning: MTU exchange failed: %v\n", err)
+	}
+
+	// Discover services
+	ss, err := client.DiscoverServices(nil)
+	if err != nil {
+		return fmt.Errorf("failed to discover services: %v", err)
+	}
+
+	// Find the RPC service
+	var rpcService *ble.Service
+	for _, s := range ss {
+		if strings.Contains(strings.ToLower(s.UUID.String()), serviceUUID) {
+			rpcService = s
+			break
+		}
+	}
+
+	if rpcService == nil {
+		return fmt.Errorf("RPC service not found")
+	}
+
+	// Discover characteristics
+	cs, err := client.DiscoverCharacteristics(nil, rpcService)
+	if err != nil {
+		return fmt.Errorf("failed to discover characteristics: %v", err)
+	}
+
+	// Find required characteristics
+	var dataChar, rxChar, txChar *ble.Characteristic
+	for _, c := range cs {
+		cUUID := strings.ToLower(c.UUID.String())
+		switch {
+		case strings.Contains(cUUID, characteristicUUIDData):
+			dataChar = c
+		case strings.Contains(cUUID, characteristicUUIDRx):
+			rxChar = c
+		case strings.Contains(cUUID, characteristicUUIDTx):
+			txChar = c
+		}
+	}
+
+	if dataChar == nil || rxChar == nil || txChar == nil {
+		return fmt.Errorf("missing required characteristics")
+	}
+
+	// Send commands to initiate data transfer
+	if err := client.WriteCharacteristic(txChar, []byte{0x00, 0x00, 0x00, 0x1f}, false); err != nil {
+		return fmt.Errorf("failed to write to TX characteristic: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	if err := client.WriteCharacteristic(dataChar, []byte(`{"id":2,"method":"join-direct"}`), false); err != nil {
+		return fmt.Errorf("failed to write to DATA characteristic: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	// Read response data
+	fmt.Println("\nReading device data...")
+	var fullData []byte
+	maxReadAttempts := 10
+
+	for i := 0; i < maxReadAttempts; i++ {
+		dataPart, err := client.ReadCharacteristic(dataChar)
+		if err != nil {
+			return fmt.Errorf("read failed (attempt %d): %v", i+1, err)
+		}
+		
+		fullData = append(fullData, dataPart...)
+		
+		// Check if we have complete JSON
+		var response map[string]interface{}
+		if json.Unmarshal(fullData, &response) == nil {
+			break
+		}
+		
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if len(fullData) == 0 {
+		return fmt.Errorf("no data received from device")
+	}
+
+	// Parse and display the state information
+	var responseData struct {
+		Result struct {
+			Body struct {
+				State map[string]interface{} `json:"state"`
+			} `json:"body"`
+		} `json:"result"`
+	}
+
+	if err := json.Unmarshal(fullData, &responseData); err != nil {
+		return fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	stateBytes, err := json.MarshalIndent(responseData.Result.Body.State, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to format state: %v", err)
+	}
+
+	fmt.Printf("\nDevice state:\n%s\n", string(stateBytes))
+	return nil
+}
+
+// Fix for connectAndHandleGoalZero function
+func connectAndHandleGoalZero(ctx context.Context, deviceAddr string) error {
+    client, err := ble.Dial(ctx, ble.NewAddr(deviceAddr))
+    if err != nil {
+        return fmt.Errorf("failed to connect: %v", err)
+    }
+    defer client.CancelConnection()
+
+    fmt.Printf("Connected to %s\n", deviceAddr)
+
+    // Exchange MTU first
+    if _, err := client.ExchangeMTU(512); err != nil {
+        fmt.Printf("Warning: MTU exchange failed: %v\n", err)
+    }
+    time.Sleep(500 * time.Millisecond)
+
+    // Discover all services
+    ss, err := client.DiscoverServices(nil)
+    if err != nil {
+        return fmt.Errorf("failed to discover services: %v", err)
+    }
+
+    // Find the RPC service by UUID prefix (without hyphens)
+    var rpcService *ble.Service
+    targetServiceUUID := "5f6d4f535f5250435f5356435f49445f"
+    for _, s := range ss {
+        if strings.ToLower(s.UUID.String()) == targetServiceUUID {
+            rpcService = s
+            break
+        }
+    }
+
+    if rpcService == nil {
+        return fmt.Errorf("RPC service not found (looking for UUID %s)", targetServiceUUID)
+    }
+
+    // Discover all characteristics in the RPC service
+    cs, err := client.DiscoverCharacteristics(nil, rpcService)
+    if err != nil {
+        return fmt.Errorf("failed to discover characteristics: %v", err)
+    }
+
+    // Find required characteristics by their full UUIDs (without hyphens)
+    var dataChar, rxChar, txChar *ble.Characteristic
+    for _, c := range cs {
+        cUUID := strings.ToLower(c.UUID.String())
+        switch cUUID {
+        case "5f6d4f535f5250435f646174615f5f5f": // DATA
+            dataChar = c
+            fmt.Println("Found DATA characteristic")
+        case "5f6d4f535f5250435f72785f63746c5f": // RX
+            rxChar = c
+            fmt.Println("Found RX characteristic")
+        case "5f6d4f535f5250435f74785f63746c5f": // TX
+            txChar = c
+            fmt.Println("Found TX characteristic")
+        }
+    }
+
+    if dataChar == nil {
+        return fmt.Errorf("DATA characteristic not found (looking for UUID 5f6d4f535f5250435f646174615f5f5f)")
+    }
+    if rxChar == nil {
+        return fmt.Errorf("RX characteristic not found (looking for UUID 5f6d4f535f5250435f72785f63746c5f)")
+    }
+    if txChar == nil {
+        return fmt.Errorf("TX characteristic not found (looking for UUID 5f6d4f535f5250435f74785f63746c5f)")
+    }
+
+    // Send command to initiate data transfer
+    fmt.Println("Sending initialization command...")
+    if err := client.WriteCharacteristic(txChar, []byte{0x00, 0x00, 0x00, 0x1a}, false); err != nil {
+        return fmt.Errorf("failed to write to TX characteristic: %v", err)
+    }
+    time.Sleep(500 * time.Millisecond)
+
+    fmt.Println("Sending status request...")
+    if err := client.WriteCharacteristic(dataChar, []byte(`{"id":2,"method":"status"}`), false); err != nil {
+        return fmt.Errorf("failed to write to DATA characteristic: %v", err)
+    }
+    time.Sleep(1 * time.Second)
+
+    // Read response data
+    fmt.Println("\nReading device data...")
+    var fullData []byte
+    maxReadAttempts := 5
+
+    for i := 0; i < maxReadAttempts; i++ {
+        dataPart, err := client.ReadCharacteristic(dataChar)
+        if err != nil {
+            fmt.Printf("Read failed (attempt %d): %v\n", i+1, err)
+            continue
+        }
+        
+        fullData = append(fullData, dataPart...)
+        
+        // Check if we have complete JSON
+        var response map[string]interface{}
+        if json.Unmarshal(fullData, &response) == nil {
+            if result, ok := response["result"].(map[string]interface{}); ok {
+                if body, ok := result["body"].(map[string]interface{}); ok {
+                    if _, ok := body["batt"]; ok {
+                        break
+                    }
+                }
+            }
+        }
+        
+        time.Sleep(500 * time.Millisecond)
+    }
+
+    if len(fullData) == 0 {
+        return fmt.Errorf("no data received from device")
+    }
+
+    // Parse and display the relevant information
+    var responseData map[string]interface{}
+    if err := json.Unmarshal(fullData, &responseData); err != nil {
+        return fmt.Errorf("failed to parse JSON response: %v\nRaw data: %s", err, string(fullData))
+    }
+
+    // Access nested data more carefully to avoid panics
+    if result, ok := responseData["result"].(map[string]interface{}); ok {
+        if body, ok := result["body"].(map[string]interface{}); ok {
+            if batt, ok := body["batt"].(map[string]interface{}); ok {
+                battBytes, err := json.MarshalIndent(batt, "", "  ")
+                if err != nil {
+                    fmt.Printf("Error marshaling battery data: %v\n", err)
+                } else {
+                    fmt.Printf("\nBattery info:\n%s\n", string(battBytes))
+                }
+            } else {
+                fmt.Println("Battery data not found in response")
+            }
+
+            if ports, ok := body["ports"].(map[string]interface{}); ok {
+                if v12Out, ok := ports["v12Out"].(map[string]interface{}); ok {
+                    portsBytes, err := json.MarshalIndent(v12Out, "", "  ")
+                    if err != nil {
+                        fmt.Printf("Error marshaling ports data: %v\n", err)
+                    } else {
+                        fmt.Printf("\nV12 Out info:\n%s\n", string(portsBytes))
+                    }
+                } else {
+                    fmt.Println("v12Out data not found in ports")
+                }
+            } else {
+                fmt.Println("Ports data not found in response")
+            }
+        } else {
+            fmt.Println("Body not found in result")
+        }
+    } else {
+        fmt.Println("Result not found in response")
+        fmt.Printf("Full response: %+v\n", responseData)
+    }
+
+    return nil
+}
+
+// JackeryNotificationData holds the notification data from Jackery devices
+type JackeryNotificationData struct {
+	Data     []byte
+	Complete bool
+}
+
+var jackeryResponseData string
+var jackeryHitCount int = 0
+
+
+func connectAndHandleJackery(ctx context.Context, deviceAddr string) error {
+    client, err := ble.Dial(ctx, ble.NewAddr(deviceAddr))
+    if err != nil {
+        return fmt.Errorf("failed to connect: %v", err)
+    }
+    defer client.CancelConnection()
+
+    fmt.Printf("Connected to Jackery device: %s\n", deviceAddr)
+
+    // Exchange MTU for larger packet size
+    if _, err := client.ExchangeMTU(512); err != nil {
+        fmt.Printf("Warning: MTU exchange failed: %v\n", err)
+    }
+
+    // Find the Jackery service and characteristics
+    ss, err := client.DiscoverServices(nil)
+    if err != nil {
+        return fmt.Errorf("failed to discover services: %v", err)
+    }
+
+    var writeChar, notifyChar *ble.Characteristic
+    for _, s := range ss {
+        cs, err := client.DiscoverCharacteristics(nil, s)
+        if err != nil {
+            continue
+        }
+
+        for _, c := range cs {
+            cUUID := strings.ToLower(c.UUID.String())
+            if strings.HasSuffix(cUUID, "ee01") {
+                writeChar = c
+            } else if strings.HasSuffix(cUUID, "ee02") {
+                notifyChar = c
+            }
+        }
+    }
+
+    if writeChar == nil || notifyChar == nil {
+        return fmt.Errorf("required characteristics not found")
+    }
+
+    // Set up notification handler
+    responseChan := make(chan []byte, 10)
+    defer close(responseChan)
+
+    // Try to enable notifications by writing to CCCD
+    fmt.Println("Attempting to enable notifications...")
+    ds, err := client.DiscoverDescriptors(nil, notifyChar)
+    if err != nil {
+        fmt.Printf("Warning: Failed to discover descriptors: %v\n", err)
+    } else {
+        for _, d := range ds {
+            if strings.HasSuffix(strings.ToLower(d.UUID.String()), "2902") {
+                fmt.Println("Found CCCD descriptor, enabling notifications...")
+                if err := client.WriteDescriptor(d, []byte{0x01, 0x00}); err != nil {
+                    fmt.Printf("Warning: Failed to write to CCCD: %v\n", err)
+                } else {
+                    fmt.Println("Successfully enabled notifications via CCCD")
+                }
+                break
+            }
+        }
+    }
+
+    // Subscribe to notifications
+    var collectedData []byte
+    if err := client.Subscribe(notifyChar, false, func(data []byte) {
+        fmt.Printf("Received notification: %x\n", data)
+        responseChan <- data
+        collectedData = append(collectedData, data...)
+    }); err != nil {
+        fmt.Printf("Warning: Failed to subscribe to notifications: %v\n", err)
+    }
+
+    // Send handshake command - this is the correct command for Jackery devices
+    handshake := []byte{0x6d, 0xc7, 0x84, 0xb9, 0xd8, 0xa4, 0x48, 0xd5, 0x18}
+    fmt.Printf("Sending handshake: %x\n", handshake)
+    
+    if err := client.WriteCharacteristic(writeChar, handshake, true); err != nil {
+        return fmt.Errorf("handshake failed: %v", err)
+    }
+
+    // Wait for response with timeout
+    fmt.Println("Waiting for response...")
+    
+    // Wait for enough data to be collected
+    // Wait for enough data to be collected
+    timeout := time.After(5 * time.Second)
+    ticker := time.NewTicker(100 * time.Millisecond)
+    defer ticker.Stop()
+
+    pendingDecoded := ""
+    nProcessed := 0
+
+    for {
+        select {
+        case <-ticker.C:
+            if len(collectedData) > 0 {
+                nProcessed += 1
+
+                // Process all collected data
+                fmt.Printf("Raw data received (%d bytes): %x\n", len(collectedData), collectedData)
+                
+                // Decrypt the data with RC4
+                // decrypted := DecryptJackeryAndDecode("8046804e45e46*SY1c5B9@", collectedData)
+                decrypted := DecryptJackeryAndDecode(key, collectedData)
+                // fmt.Printf("Decrypted data (%d bytes): %s\n", len(decrypted), decrypted)
+                pendingDecoded += decrypted
+                collectedData = []byte{}
+
+                if nProcessed == 2 {
+                    fmt.Println("Full data: ", pendingDecoded)
+                    return nil
+                }
+            }
+        case <-timeout:
+            return fmt.Errorf("timeout waiting for data")
+        case <-ctx.Done():
+            return fmt.Errorf("operation canceled")
+        }
+    }
+}
+
+// Helper function to truncate string for display
+func truncateString(s string, maxLen int) string {
+    if len(s) <= maxLen {
+        return s
+    }
+    return s[:maxLen] + "..."
+}
+
+// Helper functions
+func isValidJSON(s string) bool {
+    var js interface{}
+    return json.Unmarshal([]byte(s), &js) == nil
+}
+
+func prettyPrint(jsonStr string) {
+    var data interface{}
+    if err := json.Unmarshal([]byte(jsonStr), &data); err == nil {
+        pretty, _ := json.MarshalIndent(data, "", "  ")
+        fmt.Printf("\n=== Formatted Jackery Data ===\n%s\n", string(pretty))
+    }
+}
+
+func main() {
+	scanCtx, scanCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer scanCancel()
+
+	devices, err := scanForDevices(scanCtx)
+	if err != nil {
+		log.Fatalf("Error scanning for devices: %v", err)
+	}
+
+	fmt.Println("\n**************** Battery Monitoring for Jackery and Goal Zero *******************")
+	fmt.Println("Please pick a device to monitor from the available devices:")
+	
+	for i, device := range devices {
+		fmt.Printf("%d- %s %s [%s]\n", i+1, device.Type, device.Name, device.Address)
+	}
+
+	var choice int
+	fmt.Print("> ")
+	_, err = fmt.Scanf("%d", &choice)
+	if err != nil || choice < 1 || choice > len(devices) {
+		log.Fatalf("Invalid selection. Please enter a number between 1 and %d", len(devices))
+	}
+
+	selectedDevice := devices[choice-1]
+	fmt.Printf("Selected device: %s (%s)\n", selectedDevice.Name, selectedDevice.Address)
+
+	for {
+		connCtx, connCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		
+		var err error
+		switch selectedDevice.Type {
+		case "Yeti":
+			err = connectAndHandleYeti(connCtx, selectedDevice.Address)
+		case "gz":
+			err = connectAndHandleGoalZero(connCtx, selectedDevice.Address)
+		case "Jackery":
+			err = connectAndHandleJackery(connCtx, selectedDevice.Address)
+		default:
+			log.Fatalf("Unknown device type: %s", selectedDevice.Type)
+		}
+		
+		if err != nil {
+			log.Printf("Error: %v\n", err)
+		}
+		
+		connCancel()
+		
+		fmt.Println("\nWaiting 30 seconds before next attempt...")
+		time.Sleep(30 * time.Second)
+	}
+}
