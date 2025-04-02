@@ -375,6 +375,7 @@ type JackeryNotificationData struct {
 var jackeryResponseData string
 var jackeryHitCount int = 0
 
+
 func connectAndHandleJackery(ctx context.Context, deviceAddr string) error {
     client, err := ble.Dial(ctx, ble.NewAddr(deviceAddr))
     if err != nil {
@@ -449,7 +450,7 @@ func connectAndHandleJackery(ctx context.Context, deviceAddr string) error {
         fmt.Printf("Warning: Failed to subscribe to notifications: %v\n", err)
     }
 
-    // Send handshake command
+    // Send handshake command - this is the correct command for Jackery devices
     handshake := []byte{0x6d, 0xc7, 0x84, 0xb9, 0xd8, 0xa4, 0x48, 0xd5, 0x18}
     fmt.Printf("Sending handshake: %x\n", handshake)
     
@@ -461,6 +462,7 @@ func connectAndHandleJackery(ctx context.Context, deviceAddr string) error {
     fmt.Println("Waiting for response...")
     
     // Wait for enough data to be collected
+    // Wait for enough data to be collected
     timeout := time.After(5 * time.Second)
     ticker := time.NewTicker(100 * time.Millisecond)
     defer ticker.Stop()
@@ -470,113 +472,187 @@ func connectAndHandleJackery(ctx context.Context, deviceAddr string) error {
         case <-ticker.C:
             if len(collectedData) > 0 {
                 // Process all collected data
-                fmt.Printf("Raw data received: %x\n", collectedData)
+                fmt.Printf("Raw data received (%d bytes): %x\n", len(collectedData), collectedData)
                 
-                // Decrypt the data
+                // Decrypt the data with RC4
                 decrypted := DecryptJackery(defaultJackeryKey, collectedData)
-                fmt.Printf("Decrypted data: %x\n", decrypted)
+                fmt.Printf("Decrypted data (%d bytes): %x\n", len(decrypted), decrypted)
                 
-                if len(decrypted) < 13 {
-                    return fmt.Errorf("decrypted data too short (%d bytes)", len(decrypted))
-                }
-
-                // Try multiple decoding approaches
-                
-                // First try: standard format with 10-byte header and 3-byte footer
-                if len(decrypted) >= 13 {
-                    payload := decrypted[10 : len(decrypted)-3]
-                    xorKey := decrypted[len(decrypted)-3]
+                // Print hex representation for debugging
+                fmt.Println("\nHex dump of decrypted data:")
+                for i := 0; i < len(decrypted); i += 16 {
+                    end := i + 16
+                    if end > len(decrypted) {
+                        end = len(decrypted)
+                    }
+                    chunk := decrypted[i:end]
                     
-                    var result strings.Builder
-                    for _, b := range payload {
-                        result.WriteByte(b ^ xorKey)
+                    // Print hex values
+                    hexStr := ""
+                    for _, b := range chunk {
+                        hexStr += fmt.Sprintf("%02x ", b)
                     }
                     
-                    decodedStr := result.String()
-                    fmt.Printf("\n=== Jackery Device Data (Format 1) ===\n%s\n", decodedStr)
-                    
-                    // Try to parse as JSON
-                    var jsonData interface{}
-                    if err := json.Unmarshal([]byte(decodedStr), &jsonData); err == nil {
-                        // If valid JSON, pretty-print it
-                        prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
-                        fmt.Printf("\n=== Formatted Jackery Data ===\n%s\n", string(prettyJSON))
-                        return nil
-                    }
-                }
-                
-                // Second try: alternative format (some models use a different structure)
-                if len(decrypted) >= 20 {
-                    // Different payload position - start after first 16 bytes
-                    payload := decrypted[16 : len(decrypted)-4]
-                    xorKey := decrypted[len(decrypted)-4]
-                    
-                    var result strings.Builder
-                    for _, b := range payload {
-                        result.WriteByte(b ^ xorKey)
+                    // Print ASCII representation
+                    asciiStr := ""
+                    for _, b := range chunk {
+                        if b >= 32 && b <= 126 { // Printable ASCII
+                            asciiStr += string(b)
+                        } else {
+                            asciiStr += "."
+                        }
                     }
                     
-                    decodedStr := result.String()
-                    fmt.Printf("\n=== Jackery Device Data (Format 2) ===\n%s\n", decodedStr)
-                    
-                    // Try to parse as JSON
-                    var jsonData interface{}
-                    if err := json.Unmarshal([]byte(decodedStr), &jsonData); err == nil {
-                        // If valid JSON, pretty-print it
-                        prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
-                        fmt.Printf("\n=== Formatted Jackery Data ===\n%s\n", string(prettyJSON))
-                        return nil
-                    }
+                    fmt.Printf("%04x: %-48s %s\n", i, hexStr, asciiStr)
                 }
                 
-                // If we get here, try one more approach - sometimes there's no XOR at all
-                if len(decrypted) > 10 {
-                    payload := decrypted[10:]
-                    decodedStr := string(payload)
-                    fmt.Printf("\n=== Jackery Device Data (Format 3) ===\n%s\n", decodedStr)
+                // Try multiple known Jackery formats
+                
+                // Format 1: Common in newer models
+                // Data starts at byte 16, XOR key at end-3
+                if len(decrypted) > 20 {
+                    fmt.Println("\nTrying Format 1 (newer models)...")
+                    payload := decrypted[16:]
                     
-                    // Try to parse as JSON
-                    var jsonData interface{}
-                    if err := json.Unmarshal([]byte(decodedStr), &jsonData); err == nil {
-                        // If valid JSON, pretty-print it
-                        prettyJSON, _ := json.MarshalIndent(jsonData, "", "  ")
-                        fmt.Printf("\n=== Formatted Jackery Data ===\n%s\n", string(prettyJSON))
-                        return nil
+                    // Try each byte as a potential XOR key
+                    for i := 0; i < 10; i++ {
+                        if len(decrypted) <= i {
+                            break
+                        }
+                        
+                        potentialKey := decrypted[len(decrypted)-1-i]
+                        fmt.Printf("Trying XOR key 0x%02x (from end-%d)\n", potentialKey, i+1)
+                        
+                        decoded := make([]byte, len(payload))
+                        for j, b := range payload {
+                            decoded[j] = b ^ potentialKey
+                        }
+                        
+                        // Check if resulting data has JSON format
+                        jsonStart := -1
+                        jsonEnd := -1
+                        
+                        for j := 0; j < len(decoded); j++ {
+                            if decoded[j] == '{' {
+                                jsonStart = j
+                                break
+                            }
+                        }
+                        
+                        if jsonStart >= 0 {
+                            bracketCount := 1
+                            for j := jsonStart + 1; j < len(decoded); j++ {
+                                if decoded[j] == '{' {
+                                    bracketCount++
+                                } else if decoded[j] == '}' {
+                                    bracketCount--
+                                    if bracketCount == 0 {
+                                        jsonEnd = j
+                                        break
+                                    }
+                                }
+                            }
+                            
+                            if jsonEnd > jsonStart {
+                                jsonData := decoded[jsonStart:jsonEnd+1]
+                                if isValidJSON(string(jsonData)) {
+                                    fmt.Printf("\n=== Valid JSON Found (Format 1, key=0x%02x) ===\n", potentialKey)
+                                    prettyPrint(string(jsonData))
+                                    return nil
+                                }
+                            }
+                        }
                     }
                 }
                 
-                fmt.Println("Warning: Could not decode data in any known format")
+                // Format 2: Used in some older models
+                // Try direct string search in decrypted data
+                fmt.Println("\nTrying direct JSON search in decrypted data...")
+                for i := 0; i < len(decrypted); i++ {
+                    if decrypted[i] == '{' {
+                        bracketCount := 1
+                        for j := i + 1; j < len(decrypted); j++ {
+                            if decrypted[j] == '{' {
+                                bracketCount++
+                            } else if decrypted[j] == '}' {
+                                bracketCount--
+                                if bracketCount == 0 {
+                                    jsonCandidate := string(decrypted[i:j+1])
+                                    fmt.Printf("Found potential JSON: %s\n", jsonCandidate)
+                                    
+                                    if isValidJSON(jsonCandidate) {
+                                        fmt.Println("\n=== Valid JSON Found (direct search) ===")
+                                        prettyPrint(jsonCandidate)
+                                        return nil
+                                    }
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Format 3: Special handling for specific model
+                // Some Jackery devices use a different packet format
+                fmt.Println("\nTrying alternate method (fixed header, byte-by-byte XOR)...")
+                if len(decrypted) > 20 {
+                    // Skip first 20 bytes (header)
+                    actualData := decrypted[20:]
+                    
+                    // Try each byte near the end as key
+                    for offset := 1; offset <= 5; offset++ {
+                        if len(decrypted) <= offset {
+                            continue
+                        }
+                        
+                        key := decrypted[len(decrypted)-offset]
+                        result := make([]byte, len(actualData))
+                        for i, b := range actualData {
+                            result[i] = b ^ key
+                        }
+                        
+                        // Look for readable data
+                        ascii := string(result)
+                        fmt.Printf("Key 0x%02x (end-%d): %s\n", key, offset, truncateString(ascii, 40))
+                        
+                        if strings.Contains(ascii, "{") && strings.Contains(ascii, "}") {
+                            // Extract JSON part
+                            start := strings.Index(ascii, "{")
+                            end := strings.LastIndex(ascii, "}")
+                            if start < end {
+                                jsonPart := ascii[start:end+1]
+                                if isValidJSON(jsonPart) {
+                                    fmt.Println("\n=== Valid JSON Found (Format 3) ===")
+                                    prettyPrint(jsonPart)
+                                    return nil
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                fmt.Println("\nCould not extract valid data in any known format.")
+                fmt.Println("Trying to decode the raw data as text:")
+                
+                // Print as ASCII for manual inspection
+                fmt.Println(string(decrypted))
+                
                 return nil
             }
         case <-timeout:
-            if len(collectedData) > 0 {
-                // Process whatever data we have
-                fmt.Printf("Timeout reached, processing available data: %x\n", collectedData)
-                
-                // Continue with processing as above...
-                decrypted := DecryptJackery(defaultJackeryKey, collectedData)
-                
-                if len(decrypted) < 13 {
-                    return fmt.Errorf("decrypted data too short (%d bytes)", len(decrypted))
-                }
-
-                // Standard approach
-                payload := decrypted[10 : len(decrypted)-3]
-                xorValue := decrypted[len(decrypted)-3]
-                
-                var result strings.Builder
-                for _, b := range payload {
-                    result.WriteByte(b ^ xorValue)
-                }
-
-                fmt.Printf("\n=== Jackery Device Data ===\n%s\n", result.String())
-                return nil
-            }
             return fmt.Errorf("timeout waiting for data")
         case <-ctx.Done():
             return fmt.Errorf("operation canceled")
         }
     }
+}
+
+// Helper function to truncate string for display
+func truncateString(s string, maxLen int) string {
+    if len(s) <= maxLen {
+        return s
+    }
+    return s[:maxLen] + "..."
 }
 
 // Helper functions
