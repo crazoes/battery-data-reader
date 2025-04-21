@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"strings"
-	"time"
+	"net/http"
+	"os"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-ble/ble"
 	"github.com/go-ble/ble/examples/lib/dev"
@@ -26,6 +29,9 @@ const (
 	jackeryWriteCharUUID = "0000ee01-0000-1000-8000-00805f9b34fb"
 	jackeryNotifyCharUUID = "0000ee02-0000-1000-8000-00805f9b34fb"
 	defaultJackeryKey = "6*SY1c5B9@"
+	
+	// Default HTTP port
+	defaultHTTPPort = 8080
 )
 
 type DeviceInfo struct {
@@ -33,6 +39,41 @@ type DeviceInfo struct {
 	Name    string
 	Type    string // "Yeti", "gz", or "Jackery"
 }
+
+// BatteryState stores the latest battery data
+type BatteryState struct {
+	SOC              int     `json:"soc"`                // State of charge (%)
+	PowerIn          int     `json:"power_in"`           // Power input (W)
+	PowerOut         int     `json:"power_out"`          // Power output (W)
+	RuntimeRemaining int     `json:"runtime_remaining"`  // Runtime remaining (hours)
+	Model            string  `json:"model"`              // Device model
+	MAC              string  `json:"mac"`                // Device MAC address
+	AC               struct {
+		Status string  `json:"status"`           // "on" or "off"
+		Input  float64 `json:"input"`            // AC input power (W)
+		Output float64 `json:"output"`           // AC output power (W)
+	} `json:"ac"`
+	USB struct {
+		Status string `json:"status"`            // "on" or "off"
+		Draw   int    `json:"draw"`              // USB power draw (W)
+	} `json:"usb"`
+	V12Out struct {
+		Status string `json:"status"`            // "on" or "off"
+		Draw   int    `json:"draw"`              // 12V power draw (W)
+	} `json:"v12out"`
+	Voltage     float64 `json:"voltage"`         // Battery voltage (V)
+	Temperature float64 `json:"temperature"`     // Temperature (F for Goal Zero, C for Jackery)
+	TempUnit    string  `json:"temp_unit"`       // "F" or "C"
+	LastUpdated string  `json:"last_updated"`    // Timestamp of last update
+}
+
+// Global state variable with mutex for thread safety
+var (
+	currentState BatteryState
+	stateMutex   sync.RWMutex
+	key          string
+	deviceAddr   string
+)
 
 func DecryptJackery(key string, data []byte) ([]byte, error) {
 	cipher, err := rc4.NewCipher([]byte(key))
@@ -63,9 +104,6 @@ func DecryptJackeryAndDecode(key string, data []byte) string {
 	}
 	return string(decoded)
 }
-
-var key string
-var deviceAddr string
 
 func scanForDevices(ctx context.Context) ([]*DeviceInfo, error) {
 	d, err := dev.NewDevice("default")
@@ -161,20 +199,6 @@ func scanForDevices(ctx context.Context) ([]*DeviceInfo, error) {
 	}
 
 	return foundDevices, nil
-}
-
-// Data structures for device states
-type GoalZeroState struct {
-	Batt struct {
-		SOC   int     `json:"soc"`
-		MTEF  int     `json:"mTtef"`
-		V     float64 `json:"v"`
-		CTMP  float64 `json:"cTmp"`
-	} `json:"batt"`
-	Ports map[string]struct {
-		W int `json:"w"`
-		S int `json:"s"`
-	} `json:"ports"`
 }
 
 // Function to read data from a Yeti device (single read)
@@ -294,6 +318,32 @@ func readYetiData(client ble.Client, dataChar, txChar *ble.Characteristic) error
 	fmt.Printf("voltage: %.2fV\n", batteryState.V)
 	fmt.Printf("temperature: %.2f F\n", batteryState.CTMP*9/5+32)
 
+	// Update the global state
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+	
+	currentState.SOC = batteryState.SOC
+	currentState.PowerIn = acIn
+	currentState.PowerOut = acOut
+	currentState.RuntimeRemaining = int(math.Ceil(math.Abs(float64(batteryState.MTEF))/60))
+	currentState.Model = "YETI"
+	currentState.MAC = deviceAddr
+	
+	currentState.AC.Status = acStatus
+	currentState.AC.Input = float64(acIn)
+	currentState.AC.Output = float64(acOut)
+	
+	currentState.USB.Status = usbStatus
+	currentState.USB.Draw = usbOut
+	
+	currentState.V12Out.Status = v12Status
+	currentState.V12Out.Draw = v12Out
+	
+	currentState.Voltage = batteryState.V
+	currentState.Temperature = batteryState.CTMP*9/5 + 32
+	currentState.TempUnit = "F"
+	currentState.LastUpdated = time.Now().Format(time.RFC3339)
+
 	return nil
 }
 
@@ -409,6 +459,32 @@ func readGoalZeroData(client ble.Client, dataChar, txChar *ble.Characteristic) e
 	fmt.Printf("voltage: %.2fV\n", batt.V)
 	fmt.Printf("temperature: %.2f F\n", batt.CTMP*9/5+32)
 
+	// Update the global state
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+	
+	currentState.SOC = batt.SOC
+	currentState.PowerIn = acIn
+	currentState.PowerOut = acOut
+	currentState.RuntimeRemaining = int(math.Ceil(math.Abs(float64(batt.MTEF))/60))
+	currentState.Model = "goalzero"
+	currentState.MAC = deviceAddr
+	
+	currentState.AC.Status = acStatus
+	currentState.AC.Input = float64(acIn)
+	currentState.AC.Output = float64(acOut)
+	
+	currentState.USB.Status = usbStatus
+	currentState.USB.Draw = usbOut
+	
+	currentState.V12Out.Status = v12Status
+	currentState.V12Out.Draw = v12Out
+	
+	currentState.Voltage = batt.V
+	currentState.Temperature = batt.CTMP*9/5 + 32
+	currentState.TempUnit = "F"
+	currentState.LastUpdated = time.Now().Format(time.RFC3339)
+
 	return nil
 }
 
@@ -484,6 +560,32 @@ func jackeryNotificationHandler(data []byte) {
 		
 		fmt.Printf("voltage: %.2f\n", float64(response.ACOV)/100)
 		fmt.Printf("temperature: %.1f Celsius\n", response.BT/10)
+		
+		// Update the global state
+		stateMutex.Lock()
+		defer stateMutex.Unlock()
+		
+		currentState.SOC = response.RB
+		currentState.PowerIn = response.IP
+		currentState.PowerOut = response.OP
+		currentState.RuntimeRemaining = int(runtimeHours)
+		currentState.Model = "HT Jackery"
+		currentState.MAC = deviceAddr
+		
+		currentState.AC.Status = acStatus
+		currentState.AC.Input = float64(response.IT) / 10
+		currentState.AC.Output = float64(response.OT) / 10
+		
+		// Note: Jackery data does not separately report USB/12V details
+		currentState.USB.Status = "unknown"
+		currentState.USB.Draw = 0
+		currentState.V12Out.Status = "unknown"
+		currentState.V12Out.Draw = 0
+		
+		currentState.Voltage = float64(response.ACOV) / 100
+		currentState.Temperature = response.BT / 10
+		currentState.TempUnit = "C"
+		currentState.LastUpdated = time.Now().Format(time.RFC3339)
 	}
 }
 
@@ -523,6 +625,41 @@ func readJackeryData(client ble.Client, writeChar *ble.Characteristic) error {
 			return fmt.Errorf("timeout waiting for data")
 		}
 	}
+}
+
+// HTTP handler for providing JSON data
+func batteryStateHandler(w http.ResponseWriter, r *http.Request) {
+	stateMutex.RLock()
+	defer stateMutex.RUnlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(currentState)
+}
+
+// Start the HTTP server in a separate goroutine
+func startHTTPServer(port int) chan struct{} {
+    ready := make(chan struct{})
+    
+    http.HandleFunc("/battery", batteryStateHandler)
+    
+    addr := fmt.Sprintf("0.0.0.0:%d", port)
+    server := &http.Server{
+        Addr: addr,
+    }
+    
+    go func() {
+        log.Printf("Starting HTTP server on port %d", port)
+        log.Printf("Access battery data at: http://<your-host-ip>:%d/battery", port)
+        
+        // Signal that we're about to start listening
+        close(ready)
+        
+        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("HTTP server error: %v", err)
+        }
+    }()
+    
+    return ready
 }
 
 func connectToYeti(ctx context.Context, deviceAddr string) error {
@@ -641,7 +778,8 @@ func connectToGoalZero(ctx context.Context, deviceAddr string) error {
 		return fmt.Errorf("failed to discover characteristics: %v", err)
 	}
 
-	// Find required characteristics by their full UUIDs (without hyphens)
+	// Find required characteristics by their full UUIDs (
+    // Find required characteristics by their full UUIDs (without hyphens)
 	var dataChar, rxChar, txChar *ble.Characteristic
 	for _, c := range cs {
 		cUUID := strings.ToLower(c.UUID.String())
@@ -764,6 +902,44 @@ func connectToJackery(ctx context.Context, deviceAddr string) error {
 }
 
 func main() {
+	// Parse command line flags
+	var httpPort int
+	
+	// Check if port is provided via environment variable
+	portEnv := os.Getenv("HTTP_PORT")
+	if portEnv != "" {
+		if p, err := strconv.Atoi(portEnv); err == nil && p > 0 && p < 65536 {
+			httpPort = p
+		} else {
+			httpPort = defaultHTTPPort
+		}
+	} else {
+		httpPort = defaultHTTPPort
+	}
+	
+	// Parse arguments for port
+	if len(os.Args) > 1 {
+		for i := 1; i < len(os.Args); i++ {
+			if os.Args[i] == "-port" && i+1 < len(os.Args) {
+				if p, err := strconv.Atoi(os.Args[i+1]); err == nil && p > 0 && p < 65536 {
+					httpPort = p
+					break
+				}
+			}
+		}
+	}
+	
+    // Start HTTP server and wait for it to be ready
+    ready := startHTTPServer(httpPort)
+    <-ready  // Wait for server to start listening
+
+	// Initialize default empty state
+	currentState = BatteryState{
+		Model:     "Unknown",
+		LastUpdated: time.Now().Format(time.RFC3339),
+	}
+	
+	// Scan for devices
 	scanCtx, scanCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer scanCancel()
 
